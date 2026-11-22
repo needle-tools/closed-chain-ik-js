@@ -20,6 +20,8 @@ export class Joint extends Frame {
 	dofValue : Float32Array;
 	dofTarget : Float32Array;
 	dofRestPose : Float32Array;
+	dofWeights : Float32Array;
+	dofStiffness : Float32Array;
 
 	minDoFLimit : Float32Array;
 	maxDoFLimit : Float32Array;

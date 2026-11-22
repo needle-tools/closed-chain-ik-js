@@ -400,6 +400,30 @@ Rest pose of each degree of freedom indexed by `DOF` value. The solver moves the
 toward these when `restPoseSet` is true and it does not compromise the other goals.
 
 
+### .dofWeights
+
+```js
+dofWeights: Float32Array
+```
+
+Relative cost of moving each degree of freedom indexed by `DOF` value, such as its
+effective inertia. When a goal can be reached in several ways, the solver moves the
+degrees of freedom with lower weights more. Weights scale the damping of the solve and
+must be positive. Defaults to `1`.
+
+
+### .dofStiffness
+
+```js
+dofStiffness: Float32Array
+```
+
+Spring stiffness pulling each degree of freedom indexed by `DOF` value toward
+`dofRestPose`, relative to the goals. The solve settles where the goal error and the
+springs balance; the goal error is the one limited by the solver's error clamps.
+Defaults to `0`, no spring.
+
+
 ### .minDoFLimit
 
 ```js

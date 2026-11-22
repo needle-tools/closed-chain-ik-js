@@ -310,184 +310,195 @@ export class ChainSolver {
 			const jacobian = matrixPool.get( errorRows, freeDoF );
 			this.fillJacobian( targetJoints, freeJoints, jacobian );
 
-			// Solve for the pseudo inverse of the jacobian
-			const pseudoInverse = matrixPool.get( freeDoF, errorRows );
-			if ( this.jacobianCacheEquals( jacobian ) ) {
+			// Weighted degrees of freedom and springs use a regularized normal equation solve.
+			const weighted = this.usesDoFWeights( freeJoints );
+			let deltaTheta;
+			if ( weighted ) {
 
-				this.restorePseudoInverse( pseudoInverse );
+				deltaTheta = this.solveWeightedStep( freeJoints, jacobian, errorVector, freeDoF, errorRows );
 
 			} else {
 
-				let failedSVD = false;
-				if ( useSVD ) {
+				// Solve for the pseudo inverse of the jacobian
+				const pseudoInverse = matrixPool.get( freeDoF, errorRows );
+				if ( this.jacobianCacheEquals( jacobian ) ) {
 
-					try {
+					this.restorePseudoInverse( pseudoInverse );
 
-						const m = errorRows;
-						const n = freeDoF;
-						const k = Math.min( m, n );
+				} else {
 
-						const u = matrixPool.get( m, k ); // m x k
-						const q = matrixPool.get( k, k ); // k x k
-						const v = matrixPool.get( n, k ); // ( k x n )^T -> ( n x k )
+					let failedSVD = false;
+					if ( useSVD ) {
 
-						mat.svd( u, q, v, jacobian );
+						try {
 
-						const uTranspose = matrixPool.get( k, m );
-						const qInverse = matrixPool.get( k, k );
-						mat.transpose( uTranspose, u );
+							const m = errorRows;
+							const n = freeDoF;
+							const k = Math.min( m, n );
 
-						// Damped pseudo-inverse: σ / (σ² + λ²)
-						// Singular values that are small relative to the largest get additional damping that
-						// ramps up as they approach zero so steps stay bounded near singularities.
-						// See Chiaverini, Siciliano, Egeland, "Review of the damped least-squares inverse kinematics
-						// with experiments on an industrial robot manipulator", IEEE Trans. Control Systems Technology, 1994
-						// and Section III-B, eq. 12 of Colomé, Torras, "Closed-Loop Inverse Kinematics for Redundant Robots:
-						// Comparative Assessment and Two Enhancements", IEEE/ASME Trans. Mechatronics, 2015.
-						// https://digital.csic.es/bitstream/10261/133046/1/Two%20Enhancements.pdf
-						let sigmaMax = 0;
-						for ( let i = 0, l = q.length; i < l; i ++ ) {
+							const u = matrixPool.get( m, k ); // m x k
+							const q = matrixPool.get( k, k ); // k x k
+							const v = matrixPool.get( n, k ); // ( k x n )^T -> ( n x k )
 
-							sigmaMax = Math.max( sigmaMax, mat.get( q, i, i ) );
+							mat.svd( u, q, v, jacobian );
 
-						}
+							const uTranspose = matrixPool.get( k, m );
+							const qInverse = matrixPool.get( k, k );
+							mat.transpose( uTranspose, u );
 
-						const singularityThreshold = sigmaMax * this.singularityRatio;
-						const lambda2 = dampingFactor ** 2;
-						for ( let i = 0, l = q.length; i < l; i ++ ) {
+							// Damped pseudo-inverse: σ / (σ² + λ²)
+							// Singular values that are small relative to the largest get additional damping that
+							// ramps up as they approach zero so steps stay bounded near singularities.
+							// See Chiaverini, Siciliano, Egeland, "Review of the damped least-squares inverse kinematics
+							// with experiments on an industrial robot manipulator", IEEE Trans. Control Systems Technology, 1994
+							// and Section III-B, eq. 12 of Colomé, Torras, "Closed-Loop Inverse Kinematics for Redundant Robots:
+							// Comparative Assessment and Two Enhancements", IEEE/ASME Trans. Mechatronics, 2015.
+							// https://digital.csic.es/bitstream/10261/133046/1/Two%20Enhancements.pdf
+							let sigmaMax = 0;
+							for ( let i = 0, l = q.length; i < l; i ++ ) {
 
-							const sigma = mat.get( q, i, i );
-							let damping = lambda2;
-							if ( sigma < singularityThreshold ) {
-
-								const ratio = sigma / singularityThreshold;
-								damping += singularityThreshold * singularityThreshold * ( 1 - ratio * ratio );
+								sigmaMax = Math.max( sigmaMax, mat.get( q, i, i ) );
 
 							}
 
-							const inv = sigma / ( sigma * sigma + damping );
-							mat.set( qInverse, i, i, inv );
+							const singularityThreshold = sigmaMax * this.singularityRatio;
+							const lambda2 = dampingFactor ** 2;
+							for ( let i = 0, l = q.length; i < l; i ++ ) {
+
+								const sigma = mat.get( q, i, i );
+								let damping = lambda2;
+								if ( sigma < singularityThreshold ) {
+
+									const ratio = sigma / singularityThreshold;
+									damping += singularityThreshold * singularityThreshold * ( 1 - ratio * ratio );
+
+								}
+
+								const inv = sigma / ( sigma * sigma + damping );
+								mat.set( qInverse, i, i, inv );
+
+							}
+
+							// V * Qinv * Ut
+							const vqinv = matrixPool.get( n, k );
+							mat.multiply( vqinv, v, qInverse );
+							mat.multiply( pseudoInverse, vqinv, uTranspose );
+
+						} catch {
+
+							failedSVD = true;
 
 						}
 
-						// V * Qinv * Ut
-						const vqinv = matrixPool.get( n, k );
-						mat.multiply( vqinv, v, qInverse );
-						mat.multiply( pseudoInverse, vqinv, uTranspose );
+					}
 
-					} catch {
+					if ( ! useSVD || failedSVD ) {
 
-						failedSVD = true;
+						// Use a transpose pseudo inverse approach: A^T * A * x = A^T * b with the damping term
+						// J^T * J * x = J^T * e
+						// x = J^T * ( J * J^T )^-1 * e
+
+						// and with the adding damping
+						// x = J^T * ( J * J^T + l^2 * I )^-1 * e
+
+						// l^2 * I
+						const jacobianIdentityDamping = matrixPool.get( errorRows, errorRows );
+						mat.identity( jacobianIdentityDamping );
+						mat.scale( jacobianIdentityDamping, jacobianIdentityDamping, this.dampingFactor ** 2 );
+
+						// J^T
+						const jacobianTranspose = matrixPool.get( freeDoF, errorRows );
+						mat.transpose( jacobianTranspose, jacobian );
+
+						// J * J^T
+						const jjt = matrixPool.get( errorRows, errorRows );
+						mat.multiply( jjt, jacobian, jacobianTranspose );
+
+						// J * J^T + l^2 * I
+						const jjti = matrixPool.get( errorRows, errorRows );
+						mat.add( jjti, jjt, jacobianIdentityDamping );
+
+						// ( J * J^T + l^2 * I )^-1
+						const jjtii = matrixPool.get( errorRows, errorRows );
+						mat.invert( jjtii, jjti );
+
+						// J^T * ( J * J^T + l^2 * I )^-1
+						mat.multiply( pseudoInverse, jacobianTranspose, jjtii );
 
 					}
 
-				}
-
-				if ( ! useSVD || failedSVD ) {
-
-					// Use a transpose pseudo inverse approach: A^T * A * x = A^T * b with the damping term
-					// J^T * J * x = J^T * e
-					// x = J^T * ( J * J^T )^-1 * e
-
-					// and with the adding damping
-					// x = J^T * ( J * J^T + l^2 * I )^-1 * e
-
-					// l^2 * I
-					const jacobianIdentityDamping = matrixPool.get( errorRows, errorRows );
-					mat.identity( jacobianIdentityDamping );
-					mat.scale( jacobianIdentityDamping, jacobianIdentityDamping, this.dampingFactor ** 2 );
-
-					// J^T
-					const jacobianTranspose = matrixPool.get( freeDoF, errorRows );
-					mat.transpose( jacobianTranspose, jacobian );
-
-					// J * J^T
-					const jjt = matrixPool.get( errorRows, errorRows );
-					mat.multiply( jjt, jacobian, jacobianTranspose );
-
-					// J * J^T + l^2 * I
-					const jjti = matrixPool.get( errorRows, errorRows );
-					mat.add( jjti, jjt, jacobianIdentityDamping );
-
-					// ( J * J^T + l^2 * I )^-1
-					const jjtii = matrixPool.get( errorRows, errorRows );
-					mat.invert( jjtii, jjti );
-
-					// J^T * ( J * J^T + l^2 * I )^-1
-					mat.multiply( pseudoInverse, jacobianTranspose, jjtii );
+					// save the results for warm start
+					this.cacheJacobianResult( jacobian, pseudoInverse );
 
 				}
 
-				// save the results for warm start
-				this.cacheJacobianResult( jacobian, pseudoInverse );
+				// x = deltaTheta = J^T * ( J * J^T + l^2 * I )^-1 * e
+				deltaTheta = matrixPool.get( freeDoF, 1 );
+				mat.multiply( deltaTheta, pseudoInverse, errorVector );
 
-			}
+				if ( restPoseFactor !== 0 ) {
 
-			// x = deltaTheta = J^T * ( J * J^T + l^2 * I )^-1 * e
-			const deltaTheta = matrixPool.get( freeDoF, 1 );
-			mat.multiply( deltaTheta, pseudoInverse, errorVector );
+					// Nullspace Projection
+					// I - J^-1 * J is the orthogonal null space of J where J^-1 is the pseudoinverse
+					// Multiplied by the rest position of each dof
+					// ( I - J^-1 * J ) * restPose
+					const restPose = matrixPool.get( freeDoF, 1 );
+					const restPoseResult = matrixPool.get( freeDoF, 1 );
+					let colIndex = 0;
+					for ( let i = 0, l = freeJoints.length; i < l; i ++ ) {
 
-			if ( restPoseFactor !== 0 ) {
+						const joint = freeJoints[ i ];
+						const lockedDoFCount = this.lockedJointDoFCount.get( joint ) || 0;
+						const isLocked = lockedDoFCount !== 0;
+						const lockedDoF = this.lockedJointDoF.get( joint );
 
-				// Nullspace Projection
-				// I - J^-1 * J is the orthogonal null space of J where J^-1 is the pseudoinverse
-				// Multiplied by the rest position of each dof
-				// ( I - J^-1 * J ) * restPose
-				const restPose = matrixPool.get( freeDoF, 1 );
-				const restPoseResult = matrixPool.get( freeDoF, 1 );
-				let colIndex = 0;
-				for ( let i = 0, l = freeJoints.length; i < l; i ++ ) {
+						const colCount = joint.rotationDoFCount + joint.translationDoFCount - lockedDoFCount;
+						if ( joint.restPoseSet ) {
 
-					const joint = freeJoints[ i ];
-					const lockedDoFCount = this.lockedJointDoFCount.get( joint ) || 0;
-					const isLocked = lockedDoFCount !== 0;
-					const lockedDoF = this.lockedJointDoF.get( joint );
+							const dofList = joint.dof;
+							const dofValues = joint.dofValues;
+							const dofRestPose = joint.dofRestPose;
+							for ( let d = 0; d < colCount; d ++ ) {
 
-					const colCount = joint.rotationDoFCount + joint.translationDoFCount - lockedDoFCount;
-					if ( joint.restPoseSet ) {
+								const dof = dofList[ d ];
 
-						const dofList = joint.dof;
-						const dofValues = joint.dofValues;
-						const dofRestPose = joint.dofRestPose;
-						for ( let d = 0; d < colCount; d ++ ) {
+								if ( isLocked && lockedDoF[ dof ] ) continue;
 
-							const dof = dofList[ d ];
+								mat.set( restPose, colIndex, 0, dofRestPose[ dof ] - dofValues[ dof ] );
+								colIndex ++;
 
-							if ( isLocked && lockedDoF[ dof ] ) continue;
+							}
 
-							mat.set( restPose, colIndex, 0, dofRestPose[ dof ] - dofValues[ dof ] );
-							colIndex ++;
+						} else {
+
+							// No rest pose set, values already zeroed
+							colIndex += colCount;
 
 						}
 
-					} else {
-
-						// No rest pose set, values already zeroed
-						colIndex += colCount;
-
 					}
 
-				}
+					// Nullspace projection: "restPose - J^-1 * (J * restPose)" which is mathematically
+					// equivalent to "(I - J^-1 * J) * restPose". This version avoids constructing and
+					// performing a freeDoF x freeDoF multiplication needed for the identity calculations.
 
-				// Nullspace projection: "restPose - J^-1 * (J * restPose)" which is mathematically
-				// equivalent to "(I - J^-1 * J) * restPose". This version avoids constructing and
-				// performing a freeDoF x freeDoF multiplication needed for the identity calculations.
+					// J * restPose > errorRows x 1
+					const jRestPose = matrixPool.get( errorRows, 1 );
+					mat.multiply( jRestPose, jacobian, restPose );
 
-				// J * restPose > errorRows x 1
-				const jRestPose = matrixPool.get( errorRows, 1 );
-				mat.multiply( jRestPose, jacobian, restPose );
+					// J^-1 * (J * restPose) > freeDoF x 1
+					const jijRestPose = matrixPool.get( freeDoF, 1 );
+					mat.multiply( jijRestPose, pseudoInverse, jRestPose );
 
-				// J^-1 * (J * restPose) > freeDoF x 1
-				const jijRestPose = matrixPool.get( freeDoF, 1 );
-				mat.multiply( jijRestPose, pseudoInverse, jRestPose );
+					// restPose - J^-1 * (J * restPose) > freeDoF x 1
+					mat.subtract( restPoseResult, restPose, jijRestPose );
 
-				// restPose - J^-1 * (J * restPose) > freeDoF x 1
-				mat.subtract( restPoseResult, restPose, jijRestPose );
+					for ( let r = 0; r < freeDoF; r ++ ) {
 
-				for ( let r = 0; r < freeDoF; r ++ ) {
+						const val = mat.get( restPoseResult, r, 0 );
+						mat.set( deltaTheta, r, 0, mat.get( deltaTheta, r, 0 ) + val * restPoseFactor );
 
-					const val = mat.get( restPoseResult, r, 0 );
-					mat.set( deltaTheta, r, 0, mat.get( deltaTheta, r, 0 ) + val * restPoseFactor );
+					}
 
 				}
 
@@ -525,7 +536,7 @@ export class ChainSolver {
 			// divergence tolerance to be kept at all.
 			let stepScale = 1;
 			let bestScale = 0;
-			let bestError = totalError + divergeThreshold;
+			let bestError = ( weighted ? this.weightedObjective( freeJoints, targetJoints, dofResultInfo ) : totalError ) + divergeThreshold;
 			for ( let attempt = 0; attempt < MAX_LINE_SEARCH_STEPS; attempt ++ ) {
 
 				this.applyJointAngles( freeJoints, deltaTheta, stepScale );
@@ -536,7 +547,7 @@ export class ChainSolver {
 				freeJoints.length = 0;
 				this.countUnconvergedVariables( freeJoints, targetJoints, dofResultInfo );
 
-				const stepError = dofResultInfo.totalError;
+				const stepError = weighted ? this.weightedObjective( freeJoints, targetJoints, dofResultInfo ) : dofResultInfo.totalError;
 				const improved = stepError < bestError;
 				if ( improved ) {
 
@@ -595,6 +606,122 @@ export class ChainSolver {
 		targetJoints.length = 0;
 		freeJoints.length = 0;
 		return status;
+
+	}
+
+	// Whether any free, unlocked degree of freedom has a non-default weight or a spring
+	usesDoFWeights( freeJoints ) {
+
+		const { lockedJointDoF, lockedJointDoFCount } = this;
+		for ( let i = 0, l = freeJoints.length; i < l; i ++ ) {
+
+			const joint = freeJoints[ i ];
+			const lockedDoF = lockedJointDoF.get( joint );
+			const isLocked = lockedJointDoFCount.has( joint );
+			for ( const dof of joint.dof ) {
+
+				if ( isLocked && lockedDoF[ dof ] ) continue;
+				if ( joint.dofWeights[ dof ] !== 1 || joint.dofStiffness[ dof ] !== 0 ) return true;
+
+			}
+
+		}
+
+		return false;
+
+	}
+
+	// Calls the callback for every free, unlocked degree of freedom in column order
+	forEachFreeDoF( freeJoints, callback ) {
+
+		const { lockedJointDoF, lockedJointDoFCount } = this;
+		let column = 0;
+		for ( let i = 0, l = freeJoints.length; i < l; i ++ ) {
+
+			const joint = freeJoints[ i ];
+			const lockedDoF = lockedJointDoF.get( joint );
+			const isLocked = lockedJointDoFCount.has( joint );
+			for ( const dof of joint.dof ) {
+
+				if ( isLocked && lockedDoF[ dof ] ) continue;
+				callback( joint, dof, column ++ );
+
+			}
+
+		}
+
+	}
+
+	// Minimizes |J x - e|^2 + sum( damping^2 * w * x^2 ) + sum( k * ( value + x - rest )^2 ):
+	// x = ( J^T J + diag( damping^2 * w + k ) )^-1 ( J^T e + k * ( rest - value ) )
+	// At a fixed point J^T e balances the springs, and lower weights take more of each step.
+	solveWeightedStep( freeJoints, jacobian, errorVector, freeDoF, errorRows ) {
+
+		const { matrixPool, dampingFactor } = this;
+		const lambda2 = dampingFactor ** 2;
+
+		const jacobianTranspose = matrixPool.get( freeDoF, errorRows );
+		mat.transpose( jacobianTranspose, jacobian );
+
+		const normal = matrixPool.get( freeDoF, freeDoF );
+		mat.multiply( normal, jacobianTranspose, jacobian );
+
+		const rhs = matrixPool.get( freeDoF, 1 );
+		mat.multiply( rhs, jacobianTranspose, errorVector );
+
+		this.forEachFreeDoF( freeJoints, ( joint, dof, column ) => {
+
+			const weight = joint.dofWeights[ dof ];
+			const stiffness = joint.dofStiffness[ dof ];
+			if ( ! ( weight > 0 ) || ! ( stiffness >= 0 ) ) {
+
+				throw new Error( 'ChainSolver: Degree of freedom weights must be positive and stiffness nonnegative.' );
+
+			}
+
+			mat.set( normal, column, column, mat.get( normal, column, column ) + lambda2 * weight + stiffness );
+			if ( stiffness !== 0 ) {
+
+				const pull = stiffness * ( joint.dofRestPose[ dof ] - joint.dofValues[ dof ] );
+				mat.set( rhs, column, 0, mat.get( rhs, column, 0 ) + pull );
+
+			}
+
+		} );
+
+		const inverse = matrixPool.get( freeDoF, freeDoF );
+		mat.invert( inverse, normal );
+
+		const deltaTheta = matrixPool.get( freeDoF, 1 );
+		mat.multiply( deltaTheta, inverse, rhs );
+		return deltaTheta;
+
+	}
+
+	// The quantity the weighted step minimizes, used to accept or shorten that step
+	weightedObjective( freeJoints, targetJoints, dofResultInfo ) {
+
+		let total = 0;
+		if ( dofResultInfo.errorRows !== 0 ) {
+
+			const errorVector = this.matrixPool.get( dofResultInfo.errorRows, 1 );
+			this.fillErrorVector( targetJoints, errorVector );
+			for ( let r = 0, l = dofResultInfo.errorRows; r < l; r ++ ) {
+
+				total += mat.get( errorVector, r, 0 ) ** 2;
+
+			}
+
+		}
+
+		this.forEachFreeDoF( freeJoints, ( joint, dof ) => {
+
+			const stiffness = joint.dofStiffness[ dof ];
+			if ( stiffness !== 0 ) total += stiffness * ( joint.dofValues[ dof ] - joint.dofRestPose[ dof ] ) ** 2;
+
+		} );
+
+		return total;
 
 	}
 

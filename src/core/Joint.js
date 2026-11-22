@@ -129,6 +129,24 @@ export class Joint extends Frame {
 		this.dofRestPose = new Float32Array( 6 );
 
 		/**
+		 * Relative cost of moving each degree of freedom indexed by `DOF` value, such as its
+		 * effective inertia. When a goal can be reached in several ways, the solver moves the
+		 * degrees of freedom with lower weights more. Weights scale the damping of the solve and
+		 * must be positive. Defaults to `1`.
+		 * @type {Float32Array}
+		 */
+		this.dofWeights = new Float32Array( 6 ).fill( 1 );
+
+		/**
+		 * Spring stiffness pulling each degree of freedom indexed by `DOF` value toward
+		 * `dofRestPose`, relative to the goals. The solve settles where the goal error and the
+		 * springs balance; the goal error is the one limited by the solver's error clamps.
+		 * Defaults to `0`, no spring.
+		 * @type {Float32Array}
+		 */
+		this.dofStiffness = new Float32Array( 6 );
+
+		/**
 		 * Minimum limit of each degree of freedom indexed by `DOF` value.
 		 * @type {Float32Array}
 		 * @readonly
@@ -340,6 +358,8 @@ export class Joint extends Frame {
 		this.dofValues.fill( 0 );
 		this.dofTarget.fill( 0 );
 		this.dofRestPose.fill( 0 );
+		this.dofWeights.fill( 1 );
+		this.dofStiffness.fill( 0 );
 
 		this.minDoFLimit.fill( - Infinity );
 		this.maxDoFLimit.fill( Infinity );
